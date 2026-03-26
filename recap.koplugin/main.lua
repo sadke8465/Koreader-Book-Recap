@@ -85,17 +85,17 @@ local MAX_PAGE_CHARS = 900
 local SETTINGS_PATH = DataStorage:getSettingsDir() .. "/recap.lua"
 
 --- Load static config (api_key, api_url, model_name, request_timeout).
---- config.lua is the recommended place to paste your API key.
+--- recap_config.lua is the recommended place to paste your API key.
 local CONFIG = {}
 do
-    local ok, mod = pcall(require, "config")
+    local ok, mod = pcall(require, "recap_config")
     if ok and type(mod) == "table" then CONFIG = mod end
 end
 
---- Load the master system prompt template from prompt.lua.
+--- Load the master system prompt template from recap_prompt.lua.
 local DEFAULT_PROMPT
 do
-    local ok, mod = pcall(require, "prompt")
+    local ok, mod = pcall(require, "recap_prompt")
     if ok and type(mod) == "string" then DEFAULT_PROMPT = mod end
 end
 
@@ -106,13 +106,13 @@ local DEFAULTS = {
     api_key         = CONFIG.api_key         or "",
     model_name      = CONFIG.model_name      or "gpt-4o-mini",
     request_timeout = CONFIG.request_timeout or 30,
-    -- system_prompt comes from prompt.lua; falls back to a minimal inline string
+    -- system_prompt comes from recap_prompt.lua; falls back to a minimal inline string
     system_prompt   = DEFAULT_PROMPT or [[You are a helpful reading companion. Provide a brief, spoiler-free recap of the current reading position based on the context provided.]],
 }
 
 local Recap = WidgetContainer:extend{
     name        = "recap",
-    is_doc_only = true,   -- only visible/active when a document is open
+    is_doc_only = false,  -- visible in both file manager and reader menus
 }
 
 -- ----------------------------------------------------------------
@@ -165,8 +165,8 @@ function Recap:addToMainMenu(menu_items)
                 callback  = function()
                     self:onGenerateRecap()
                 end,
+                separator = true,
             },
-            { text = "---" },  -- visual separator
             {
                 text           = _("Settings"),
                 sub_item_table = self:_buildSettingsMenu(),

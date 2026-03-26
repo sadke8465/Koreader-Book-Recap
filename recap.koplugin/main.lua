@@ -84,25 +84,30 @@ local MAX_PAGE_CHARS = 900
 --- Path to the plugin's own settings file.
 local SETTINGS_PATH = DataStorage:getSettingsDir() .. "/recap.lua"
 
+--- Load static config (api_key, api_url, model_name, request_timeout).
+--- config.lua is the recommended place to paste your API key.
+local CONFIG = {}
+do
+    local ok, mod = pcall(require, "config")
+    if ok and type(mod) == "table" then CONFIG = mod end
+end
+
+--- Load the master system prompt template from prompt.lua.
+local DEFAULT_PROMPT
+do
+    local ok, mod = pcall(require, "prompt")
+    if ok and type(mod) == "string" then DEFAULT_PROMPT = mod end
+end
+
 --- Factory defaults — used when no user value has been saved yet.
+--- Values from config.lua take precedence over the hard-coded fallbacks here.
 local DEFAULTS = {
-    api_url  = "https://api.openai.com/v1/chat/completions",
-    api_key  = "",
-    model_name = "gpt-4o-mini",
-    --[[
-        SYSTEM PROMPT PLACEHOLDER
-        Replace the text below with your own custom instruction.
-        The model will receive this as the "system" role message.
-    --]]
-    system_prompt = [[You are a helpful reading companion. \
-The user has paused their reading and needs a brief, spoiler-free recap \
-to jog their memory before continuing. \
-Using only the context provided (title, author, chapter name, and the text \
-from the last two pages), write a warm, concise 2-3 paragraph summary of \
-what the reader has experienced so far up to this point. \
-Do NOT reveal or speculate about future plot events. \
-Focus on characters, setting, and the immediate narrative thread.]],
-    request_timeout = 30,
+    api_url         = CONFIG.api_url         or "https://api.openai.com/v1/chat/completions",
+    api_key         = CONFIG.api_key         or "",
+    model_name      = CONFIG.model_name      or "gpt-4o-mini",
+    request_timeout = CONFIG.request_timeout or 30,
+    -- system_prompt comes from prompt.lua; falls back to a minimal inline string
+    system_prompt   = DEFAULT_PROMPT or [[You are a helpful reading companion. Provide a brief, spoiler-free recap of the current reading position based on the context provided.]],
 }
 
 local Recap = WidgetContainer:extend{
@@ -414,8 +419,8 @@ end
 --- Entry point from the menu / Dispatcher.
 --- Validates config, checks connectivity, then hands off to startRecapRequest.
 function Recap:onGenerateRecap()
-    -- Guard: API key must be set
-    if (self.settings:readSetting("api_key") or "") == "" then
+    -- Guard: API key must be set (checks saved setting AND config.lua default)
+    if self:cfg("api_key") == "" then
         UIManager:show(InfoMessage:new{
             text    = _("Please set your API key under\nBook Recap → Settings → API Key\nbefore generating a recap."),
             timeout = 5,
@@ -464,6 +469,21 @@ function Recap:_startRecapRequest()
     end)
 end
 
+--- Replace {{variable}} placeholders in the system prompt template with
+--- the actual reading context values collected at runtime.
+function Recap:_fillPromptTemplate(template, ctx, raw_text)
+    -- Escape percent signs in substitution strings to avoid gsub pattern issues
+    local function esc(s)
+        return (s or ""):gsub("%%", "%%%%")
+    end
+    local result = template
+    result = result:gsub("{{book_title}}",        esc(ctx.title))
+    result = result:gsub("{{author_name}}",        esc(ctx.author))
+    result = result:gsub("{{chapter_name}}",       esc(ctx.chapter))
+    result = result:gsub("{{raw_extracted_text}}", esc(raw_text))
+    return result
+end
+
 --- Build the request payload, POST it, parse the response.
 --- All heavy lifting happens here (runs on the main thread but after the
 --- initial display refresh, so the user sees "Generating…" first).
@@ -480,10 +500,22 @@ function Recap:_performAPIRequest(context)
         return
     end
 
-    local api_url      = self:cfg("api_url")
-    local api_key      = self:cfg("api_key")
-    local model        = self:cfg("model_name")
-    local sys_prompt   = self:cfg("system_prompt")
+    local api_url  = self:cfg("api_url")
+    local api_key  = self:cfg("api_key")
+    local model    = self:cfg("model_name")
+
+    -- Build combined raw text (previous page followed by current page)
+    local raw_parts = {}
+    if context.prev_text and context.prev_text ~= "" then
+        table.insert(raw_parts, context.prev_text:sub(1, MAX_PAGE_CHARS))
+    end
+    if context.current_text and context.current_text ~= "" then
+        table.insert(raw_parts, context.current_text:sub(1, MAX_PAGE_CHARS))
+    end
+    local raw_text = table.concat(raw_parts, "\n\n")
+
+    -- Fill {{variable}} placeholders in the system prompt template
+    local sys_prompt   = self:_fillPromptTemplate(self:cfg("system_prompt"), context, raw_text)
     local user_message = self:_buildUserMessage(context)
 
     -- 5.1  Encode request body --------------------------------------------
@@ -493,7 +525,7 @@ function Recap:_performAPIRequest(context)
             { role = "system", content = sys_prompt   },
             { role = "user",   content = user_message },
         },
-        max_tokens  = 600,
+        max_tokens  = 800,
         temperature = 0.7,
     }
 
@@ -587,35 +619,11 @@ function Recap:_performAPIRequest(context)
     self:_showRecap(recap_text, context)
 end
 
---- Compose the structured user message sent to the model.
---- Text is trimmed to MAX_PAGE_CHARS so we don't blow past context limits
---- on low-bandwidth connections or small-context models.
-function Recap:_buildUserMessage(ctx)
-    local parts = {}
-
-    table.insert(parts, "Book: "    .. ctx.title)
-    table.insert(parts, "Author: "  .. ctx.author)
-    table.insert(parts, "Chapter: " .. ctx.chapter)
-    table.insert(parts, string.format("Position: page %d of %d", ctx.page_number, ctx.total_pages))
-    table.insert(parts, "")
-
-    if ctx.prev_text and ctx.prev_text ~= "" then
-        table.insert(parts, "--- Previous page ---")
-        table.insert(parts, ctx.prev_text:sub(1, MAX_PAGE_CHARS))
-        table.insert(parts, "")
-    end
-
-    if ctx.current_text and ctx.current_text ~= "" then
-        table.insert(parts, "--- Current page ---")
-        table.insert(parts, ctx.current_text:sub(1, MAX_PAGE_CHARS))
-        table.insert(parts, "")
-    end
-
-    table.insert(parts,
-        "Please provide a brief, spoiler-free recap of what has happened " ..
-        "in this story up to the current page.")
-
-    return table.concat(parts, "\n")
+--- Compose the user-role message sent to the model.
+--- The system prompt already contains all context via template substitution,
+--- so this is just a short trigger to start the generation.
+function Recap:_buildUserMessage(ctx)  -- luacheck: ignore ctx
+    return "Please generate the recap now."
 end
 
 -- ============================================================

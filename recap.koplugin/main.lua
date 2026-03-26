@@ -42,7 +42,6 @@ local InfoMessage     = require("ui/widget/infomessage")
 local TextViewer      = require("ui/widget/textviewer")
 local InputDialog     = require("ui/widget/inputdialog")
 local logger          = require("logger")
-local util            = require("util")
 local _               = require("gettext")
 
 -- JSON: KOReader ships rapidjson; fall back to the legacy "json" module
@@ -70,7 +69,8 @@ do
     if not ok then https = nil end
     ok, http  = pcall(require, "socket.http")
     if not ok then http  = nil end
-    ltn12 = require("ltn12")
+    ok, ltn12 = pcall(require, "ltn12")
+    if not ok then ltn12 = nil end
 end
 
 -- ============================================================
@@ -122,11 +122,20 @@ function Recap:init()
     -- Open (or create) the persistent settings file
     self.settings = LuaSettings:open(SETTINGS_PATH)
 
-    -- Register this plugin as a main-menu contributor
-    self.ui.menu:registerToMainMenu(self)
+    -- Register this plugin as a main-menu contributor.
+    -- Guard against nil: self.ui.menu can be absent in unusual loading contexts.
+    if self.ui and self.ui.menu then
+        self.ui.menu:registerToMainMenu(self)
+    else
+        logger.warn("Recap: self.ui.menu not available during init — menu item will not appear")
+    end
 
-    -- Register a Dispatcher action so users can bind it to a gesture/key
-    self:_registerDispatcherActions()
+    -- Register a Dispatcher action so users can bind it to a gesture/key.
+    -- Wrapped in pcall because the Dispatcher API varies across KOReader versions.
+    local ok, err = pcall(function() self:_registerDispatcherActions() end)
+    if not ok then
+        logger.warn("Recap: Dispatcher registration failed: " .. tostring(err))
+    end
 
     logger.dbg("Recap: plugin initialised")
 end
@@ -497,6 +506,12 @@ function Recap:_performAPIRequest(context)
     -- Ensure JSON library is available
     if not json then
         self:_showError(_("JSON library not available — cannot encode request."))
+        return
+    end
+
+    -- Ensure ltn12 transport helper is available
+    if not ltn12 then
+        self:_showError(_("ltn12 library not available — cannot make HTTP request."))
         return
     end
 

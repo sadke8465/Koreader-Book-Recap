@@ -163,7 +163,15 @@ function Recap:extractContext()
     local chapter = self:_chapterAtPage(current_page)
     local cur_text  = self:_pageText(current_page)
 
-    return { title = title, author = author, chapter = chapter, current_text = cur_text }
+    local prev_pages = {}
+    for i = 2, 1, -1 do
+        local p = current_page - i
+        if p >= 1 then
+            prev_pages[#prev_pages + 1] = self:_pageText(p)
+        end
+    end
+
+    return { title = title, author = author, chapter = chapter, current_text = cur_text, prev_pages = prev_pages }
 end
 
 function Recap:_chapterAtPage(page_num)
@@ -233,8 +241,13 @@ function Recap:_startRecapRequest()
         return
     end
 
-    -- Dynamically count the extracted characters
+    -- Dynamically count the extracted characters across all pages
     local char_count = context.current_text and #context.current_text or 0
+    if context.prev_pages then
+        for _, text in ipairs(context.prev_pages) do
+            char_count = char_count + #text
+        end
+    end
     local loading_msg = string.format("Extracted %d characters.\nGenerating recap…\nThis may take a few seconds.", char_count)
 
     self._loading = InfoMessage:new{ text = _(loading_msg), no_refresh_on_show = true }
@@ -244,13 +257,20 @@ function Recap:_startRecapRequest()
     UIManager:scheduleIn(0.5, function() self:_performAPIRequest(context) end)
 end
 
-function Recap:_buildUserMessage(ctx, raw_text)
+function Recap:_buildUserMessage(ctx, raw_text, prev_texts)
     local msg = string.format("I am currently reading '%s' by %s.\nI am on the chapter titled: %s.\n", ctx.title, ctx.author, ctx.chapter)
-    
+
+    if prev_texts and #prev_texts > 0 then
+        local combined = table.concat(prev_texts, "\n")
+        if combined ~= "" then
+            msg = msg .. string.format("\nFor extra context, here is the text from the previous %d page(s):\n\"\"\"\n%s\n\"\"\"\n", #prev_texts, combined)
+        end
+    end
+
     if raw_text and raw_text ~= "" then
         msg = msg .. string.format("\nFor extra context, here is the exact text on my current page:\n\"\"\"\n%s\n\"\"\"\n", raw_text)
     end
-    
+
     msg = msg .. "\nPlease generate a spoiler-free recap of the story leading up to this exact point so I can remember where I left off."
     return msg
 end
@@ -265,8 +285,15 @@ function Recap:_performAPIRequest(context)
     
     local raw_text = context.current_text and context.current_text:sub(1, MAX_PAGE_CHARS) or ""
 
+    local prev_texts = {}
+    if context.prev_pages then
+        for _, text in ipairs(context.prev_pages) do
+            prev_texts[#prev_texts + 1] = text:sub(1, MAX_PAGE_CHARS)
+        end
+    end
+
     local sys_prompt   = self:cfg("system_prompt")
-    local user_message = self:_buildUserMessage(context, raw_text)
+    local user_message = self:_buildUserMessage(context, raw_text, prev_texts)
 
     local payload_table = {
         model       = model,

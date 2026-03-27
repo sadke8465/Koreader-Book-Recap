@@ -22,12 +22,12 @@ return {
     -- ------------------------------------------------------------------
     --  API endpoint  (OpenAI-compatible)
     -- ------------------------------------------------------------------
-    api_url = "https://api.openai.com/v1/chat/completions",
+    api_url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
 
     -- ------------------------------------------------------------------
     --  Model
     -- ------------------------------------------------------------------
-    model_name = "gpt-4o-mini",
+    model_name = "gemini-2.5-pro",
 
     -- ------------------------------------------------------------------
     --  How many seconds to wait for a response before giving up

@@ -56,7 +56,7 @@ end
 local DEFAULTS = {
     api_url         = CONFIG.api_url         or "https://api.openai.com/v1/chat/completions",
     api_key         = CONFIG.api_key         or "",
-    model_name      = CONFIG.model_name      or "gpt-4o-mini",
+    model_name      = CONFIG.model_name      or "gemini-2.5-pro",
     request_timeout = CONFIG.request_timeout or 30,
     system_prompt   = "You are a highly knowledgeable reading companion. Your job is to provide brief, spoiler-free recaps of books based on the user's current reading position. Do not spoil anything past the provided chapter.",
 }

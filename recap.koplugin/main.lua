@@ -40,11 +40,12 @@ do
 end
 
 local MAX_PAGE_CHARS = 1200
-local SETTINGS_PATH = DataStorage:getSettingsDir() .. "/recap.lua"
+local SETTINGS_PATH  = DataStorage:getSettingsDir() .. "/recap.lua"
+local PLUGIN_DIR     = DataStorage:getDataDir() .. "/plugins/recap.koplugin"
 
 local CONFIG = {}
 do
-    local config_path = DataStorage:getDataDir() .. "/plugins/recap.koplugin/recap_config.lua"
+    local config_path = PLUGIN_DIR .. "/recap_config.lua"
     local func = loadfile(config_path)
     if func then
         local ok, mod = pcall(func)
@@ -59,6 +60,24 @@ local DEFAULTS = {
     request_timeout = CONFIG.request_timeout or 30,
     system_prompt   = "You are a highly knowledgeable reading companion. Your job is to provide brief, spoiler-free recaps of books based on the user's current reading position. Do not spoil anything past the provided chapter.",
 }
+
+-- Load a prompt file from the prompts/ subdirectory.
+-- Returns the prompt string, or nil if the file cannot be loaded.
+local function loadPrompt(filename)
+    local path = PLUGIN_DIR .. "/prompts/" .. filename
+    local func = loadfile(path)
+    if not func then return nil end
+    local ok, result = pcall(func)
+    if ok and type(result) == "string" then return result end
+    return nil
+end
+
+-- Replace all {{variable}} placeholders in template with values from vars table.
+local function applyTemplate(template, vars)
+    return (template:gsub("{{(%w+)}}", function(key)
+        return tostring(vars[key] or "")
+    end))
+end
 
 local Recap = WidgetContainer:extend{
     name        = "recap",
@@ -92,8 +111,18 @@ function Recap:addToMainMenu(menu_items)
         sub_item_table = {
             {
                 text      = _("Generate Recap"),
-                help_text = _("Send your reading context to an AI and display a spoiler-free recap."),
+                help_text = _("Spoiler-free recap of the story up to your current page."),
                 callback  = function() self:onGenerateRecap() end,
+            },
+            {
+                text      = _("Previous Chapter"),
+                help_text = _("Recap of the chapter you just finished."),
+                callback  = function() self:onPreviousChapterRecap() end,
+            },
+            {
+                text      = _("Character"),
+                help_text = _("What you know about a character so far (no spoilers)."),
+                callback  = function() self:onCharacterInfo() end,
                 separator = true,
             },
             {
@@ -152,6 +181,8 @@ function Recap:_buildSettingsMenu()
     }
 end
 
+-- ─── Context extraction ────────────────────────────────────────────────────
+
 function Recap:extractContext()
     local doc = self.ui.document
     if not doc then return nil, _("No document is currently open.") end
@@ -174,6 +205,85 @@ function Recap:extractContext()
     return { title = title, author = author, chapter = chapter, current_text = cur_text, prev_pages = prev_pages }
 end
 
+-- Returns info about the chapter immediately before the one containing page_num.
+-- Returns { title, first_page, last_page } or nil if no previous chapter exists.
+function Recap:_previousChapterInfo(page_num)
+    local doc = self.ui.document
+    if not doc then return nil end
+    local toc
+    local ok = pcall(function() toc = doc:getTableOfContent() end)
+    if not ok or not toc or #toc == 0 then return nil end
+
+    -- Find the TOC index whose chapter contains page_num (same logic as _chapterAtPage)
+    local current_idx = 1
+    for i, entry in ipairs(toc) do
+        if (entry.page or 0) <= page_num then
+            current_idx = i
+        else
+            break
+        end
+    end
+
+    local prev_idx = current_idx - 1
+    if prev_idx < 1 then return nil end  -- already on the first chapter
+
+    local prev_entry = toc[prev_idx]
+    -- The previous chapter ends one page before the current chapter starts
+    local current_chapter_start = toc[current_idx].page or (page_num + 1)
+    local last_page = current_chapter_start - 1
+
+    -- Cap at total page count
+    local total_pages = doc:getPageCount and doc:getPageCount() or last_page
+    if last_page > total_pages then last_page = total_pages end
+
+    return {
+        title      = prev_entry.title or _("Previous Chapter"),
+        first_page = prev_entry.page  or 1,
+        last_page  = last_page,
+    }
+end
+
+-- Build context table for the previous chapter recap.
+function Recap:extractPreviousChapterContext()
+    local doc = self.ui.document
+    if not doc then return nil, _("No document is currently open.") end
+
+    local props  = doc:getProps()
+    local title  = (props and props.title  and props.title  ~= "") and props.title  or _("Unknown Title")
+    local author = (props and props.authors and props.authors ~= "") and props.authors or _("Unknown Author")
+
+    local current_page    = doc:getCurrentPage()
+    local current_chapter = self:_chapterAtPage(current_page)
+    local prev_info       = self:_previousChapterInfo(current_page)
+
+    if not prev_info then
+        return nil, _("Could not find a previous chapter. You may be on the first chapter.")
+    end
+
+    -- Collect text from the previous chapter's pages (capped to avoid huge payloads)
+    local MAX_TOTAL_CHARS = 3000
+    local pages_text  = {}
+    local total_chars = 0
+    for p = prev_info.first_page, prev_info.last_page do
+        if total_chars >= MAX_TOTAL_CHARS then break end
+        local text = self:_pageText(p)
+        if text ~= "" then
+            local remaining = MAX_TOTAL_CHARS - total_chars
+            local chunk = text:sub(1, remaining)
+            pages_text[#pages_text + 1] = chunk
+            total_chars = total_chars + #chunk
+        end
+    end
+
+    return {
+        title                = title,
+        author               = author,
+        prev_chapter_name    = prev_info.title,
+        current_chapter_name = current_chapter,
+        raw_extracted_text   = table.concat(pages_text, "\n---\n"),
+    }
+end
+
 function Recap:_chapterAtPage(page_num)
     local doc = self.ui.document
     if not doc then return _("Unknown Chapter") end
@@ -193,15 +303,15 @@ function Recap:_pageText(page_num)
     local doc = self.ui.document
     if not doc then return "" end
 
-    -- The "Ghost Highlight" Trick
+    -- The "Ghost Highlight" Trick (only works on the currently rendered page)
     if page_num == doc:getCurrentPage() and doc.getTextFromPositions then
         local top_left     = Geom:new{ x = 0, y = 0, w = 0, h = 0 }
         local bottom_right = Geom:new{ x = Screen:getWidth(), y = Screen:getHeight(), w = 0, h = 0 }
-        
+
         local ok, result = pcall(function()
             return doc:getTextFromPositions(top_left, bottom_right, true)
         end)
-        
+
         if ok then
             local text = ""
             if type(result) == "table" and type(result.text) == "string" then
@@ -209,97 +319,186 @@ function Recap:_pageText(page_num)
             elseif type(result) == "string" then
                 text = result
             end
-            if text ~= "" then 
-                return text:match("^%s*(.-)%s*$") or "" 
+            if text ~= "" then
+                return text:match("^%s*(.-)%s*$") or ""
             end
         end
     end
 
     if doc.getPageText then
         local ok, result = pcall(function() return doc:getPageText(page_num) end)
-        if ok and type(result) == "string" and result ~= "" then 
-            return result:match("^%s*(.-)%s*$") or "" 
+        if ok and type(result) == "string" and result ~= "" then
+            return result:match("^%s*(.-)%s*$") or ""
         end
     end
 
     return ""
 end
 
+-- Concatenate prev_pages + current_text into a single raw text block.
+function Recap:_buildRawText(ctx)
+    local parts = {}
+    if ctx.prev_pages then
+        for _, text in ipairs(ctx.prev_pages) do
+            if text ~= "" then
+                parts[#parts + 1] = text:sub(1, MAX_PAGE_CHARS)
+            end
+        end
+    end
+    if ctx.current_text and ctx.current_text ~= "" then
+        parts[#parts + 1] = ctx.current_text:sub(1, MAX_PAGE_CHARS)
+    end
+    return table.concat(parts, "\n---\n")
+end
+
+-- ─── Menu actions ─────────────────────────────────────────────────────────
+
 function Recap:onGenerateRecap()
     if self:cfg("api_key") == "" then
         UIManager:show(InfoMessage:new{ text = _("Please set your API key first."), timeout = 5 })
         return
     end
-    if NetworkMgr:isConnected() then self:_startRecapRequest()
-    else NetworkMgr:runWhenOnline(function() self:_startRecapRequest() end) end
+    if NetworkMgr:isConnected() then self:_startCurrentRecap()
+    else NetworkMgr:runWhenOnline(function() self:_startCurrentRecap() end) end
 end
 
-function Recap:_startRecapRequest()
-    local context, err = self:extractContext()
-    if not context then
-        UIManager:show(InfoMessage:new{ text = _("Could not read document."), timeout = 5 })
+function Recap:_startCurrentRecap()
+    local ctx, err = self:extractContext()
+    if not ctx then
+        UIManager:show(InfoMessage:new{ text = err or _("Could not read document."), timeout = 5 })
         return
     end
 
-    -- Dynamically count the extracted characters across all pages
-    local char_count = context.current_text and #context.current_text or 0
-    if context.prev_pages then
-        for _, text in ipairs(context.prev_pages) do
-            char_count = char_count + #text
-        end
-    end
-    local loading_msg = string.format("Extracted %d characters.\nGenerating recap…\nThis may take a few seconds.", char_count)
+    local raw_text    = self:_buildRawText(ctx)
+    local template    = loadPrompt("recap_current.lua") or self:cfg("system_prompt")
+    local sys_prompt  = applyTemplate(template, {
+        book_title         = ctx.title,
+        author_name        = ctx.author,
+        chapter_name       = ctx.chapter,
+        raw_extracted_text = raw_text,
+    })
+    local user_msg    = string.format(
+        "I am reading '%s' by %s. I am currently in the chapter titled: %s. Please generate the recap as instructed.",
+        ctx.title, ctx.author, ctx.chapter)
+    local viewer_title = string.format(_("Recap — %s"), ctx.title)
 
-    self._loading = InfoMessage:new{ text = _(loading_msg), no_refresh_on_show = true }
+    self:_dispatchRequest(sys_prompt, user_msg, viewer_title, #raw_text)
+end
+
+function Recap:onPreviousChapterRecap()
+    if self:cfg("api_key") == "" then
+        UIManager:show(InfoMessage:new{ text = _("Please set your API key first."), timeout = 5 })
+        return
+    end
+    if NetworkMgr:isConnected() then self:_startPreviousChapterRecap()
+    else NetworkMgr:runWhenOnline(function() self:_startPreviousChapterRecap() end) end
+end
+
+function Recap:_startPreviousChapterRecap()
+    local ctx, err = self:extractPreviousChapterContext()
+    if not ctx then
+        UIManager:show(InfoMessage:new{ text = err or _("Could not find previous chapter."), timeout = 5 })
+        return
+    end
+
+    local template   = loadPrompt("recap_previous.lua") or self:cfg("system_prompt")
+    local sys_prompt = applyTemplate(template, {
+        book_title           = ctx.title,
+        author_name          = ctx.author,
+        prev_chapter_name    = ctx.prev_chapter_name,
+        current_chapter_name = ctx.current_chapter_name,
+        raw_extracted_text   = ctx.raw_extracted_text,
+    })
+    local user_msg = string.format(
+        "I just finished the chapter '%s' in '%s' by %s. Please recap it as instructed.",
+        ctx.prev_chapter_name, ctx.title, ctx.author)
+    local viewer_title = string.format(_("Previous Chapter — %s"), ctx.prev_chapter_name)
+
+    self:_dispatchRequest(sys_prompt, user_msg, viewer_title, #ctx.raw_extracted_text)
+end
+
+function Recap:onCharacterInfo()
+    if self:cfg("api_key") == "" then
+        UIManager:show(InfoMessage:new{ text = _("Please set your API key first."), timeout = 5 })
+        return
+    end
+
+    local dlg
+    dlg = InputDialog:new{
+        title      = _("Character Name"),
+        input_hint = _("e.g. Aragorn, Elizabeth Bennet…"),
+        buttons    = {{
+            { text = _("Cancel"), id = "close",
+              callback = function() UIManager:close(dlg) end },
+            { text = _("Look Up"), is_enter_default = true,
+              callback = function()
+                  local name = dlg:getInputText()
+                  UIManager:close(dlg)
+                  if not name or name:match("^%s*$") then return end
+                  if NetworkMgr:isConnected() then self:_startCharacterRequest(name)
+                  else NetworkMgr:runWhenOnline(function() self:_startCharacterRequest(name) end) end
+              end },
+        }},
+    }
+    UIManager:show(dlg)
+    dlg:onShowKeyboard()
+end
+
+function Recap:_startCharacterRequest(character_name)
+    local ctx, err = self:extractContext()
+    if not ctx then
+        UIManager:show(InfoMessage:new{ text = err or _("Could not read document."), timeout = 5 })
+        return
+    end
+
+    local raw_text   = self:_buildRawText(ctx)
+    local template   = loadPrompt("character_info.lua") or self:cfg("system_prompt")
+    local sys_prompt = applyTemplate(template, {
+        book_title         = ctx.title,
+        author_name        = ctx.author,
+        chapter_name       = ctx.chapter,
+        character_name     = character_name,
+        raw_extracted_text = raw_text,
+    })
+    local user_msg = string.format(
+        "I am reading '%s' by %s, currently in chapter '%s'. Tell me about the character: %s.",
+        ctx.title, ctx.author, ctx.chapter, character_name)
+    local viewer_title = string.format(_("%s — %s"), character_name, ctx.title)
+
+    self:_dispatchRequest(sys_prompt, user_msg, viewer_title, #raw_text)
+end
+
+-- ─── API request ──────────────────────────────────────────────────────────
+
+-- Show loading message, then fire the API call.
+-- char_count is used only for the loading indicator text.
+function Recap:_dispatchRequest(sys_prompt, user_msg, viewer_title, char_count)
+    local loading_msg = string.format(
+        _("Extracted %d characters.\nGenerating…\nThis may take a few seconds."),
+        char_count or 0)
+
+    self._loading = InfoMessage:new{ text = loading_msg, no_refresh_on_show = true }
     UIManager:show(self._loading)
     UIManager:forceRePaint()
 
-    UIManager:scheduleIn(0.5, function() self:_performAPIRequest(context) end)
+    UIManager:scheduleIn(0.5, function()
+        self:_performAPIRequest(sys_prompt, user_msg, viewer_title)
+    end)
 end
 
-function Recap:_buildUserMessage(ctx, raw_text, prev_texts)
-    local msg = string.format("I am currently reading '%s' by %s.\nI am on the chapter titled: %s.\n", ctx.title, ctx.author, ctx.chapter)
-
-    if prev_texts and #prev_texts > 0 then
-        local combined = table.concat(prev_texts, "\n")
-        if combined ~= "" then
-            msg = msg .. string.format("\nFor extra context, here is the text from the previous %d page(s):\n\"\"\"\n%s\n\"\"\"\n", #prev_texts, combined)
-        end
-    end
-
-    if raw_text and raw_text ~= "" then
-        msg = msg .. string.format("\nFor extra context, here is the exact text on my current page:\n\"\"\"\n%s\n\"\"\"\n", raw_text)
-    end
-
-    msg = msg .. "\nPlease generate a spoiler-free recap of the story leading up to this exact point so I can remember where I left off."
-    return msg
-end
-
-function Recap:_performAPIRequest(context)
+function Recap:_performAPIRequest(sys_prompt, user_msg, viewer_title)
     if self._loading then UIManager:close(self._loading); self._loading = nil end
     if not json or not ltn12 then self:_showError(_("Required libraries missing.")); return end
 
-    local api_url  = self:cfg("api_url")
-    local api_key  = self:cfg("api_key")
-    local model    = self:cfg("model_name")
-    
-    local raw_text = context.current_text and context.current_text:sub(1, MAX_PAGE_CHARS) or ""
-
-    local prev_texts = {}
-    if context.prev_pages then
-        for _, text in ipairs(context.prev_pages) do
-            prev_texts[#prev_texts + 1] = text:sub(1, MAX_PAGE_CHARS)
-        end
-    end
-
-    local sys_prompt   = self:cfg("system_prompt")
-    local user_message = self:_buildUserMessage(context, raw_text, prev_texts)
+    local api_url = self:cfg("api_url")
+    local api_key = self:cfg("api_key")
+    local model   = self:cfg("model_name")
 
     local payload_table = {
         model       = model,
         messages    = {
             { role = "system", content = sys_prompt },
-            { role = "user",   content = user_message },
+            { role = "user",   content = user_msg   },
         },
         max_tokens  = 800,
         temperature = 0.7,
@@ -339,15 +538,15 @@ function Recap:_performAPIRequest(context)
     end
 
     if response.choices and response.choices[1] and response.choices[1].message then
-        self:_showRecap(response.choices[1].message.content, context)
+        self:_showRecap(response.choices[1].message.content, viewer_title)
     else
         self:_showError(_("Unexpected response structure.")); return
     end
 end
 
-function Recap:_showRecap(text, context)
+function Recap:_showRecap(text, viewer_title)
     UIManager:show(TextViewer:new{
-        title  = string.format(_("Recap — %s"), context.title),
+        title  = viewer_title,
         text   = text,
         height = math.floor(Screen:getHeight() * 0.78),
     })

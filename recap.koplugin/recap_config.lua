@@ -22,12 +22,12 @@ return {
     -- ------------------------------------------------------------------
     --  API endpoint  (OpenAI-compatible)
     -- ------------------------------------------------------------------
-    api_url = "https://api.anthropic.com/v1/chat/completions",
+    api_url = "https://api.openai.com/v1/chat/completions",
 
     -- ------------------------------------------------------------------
     --  Model
     -- ------------------------------------------------------------------
-    model_name = "claude-sonnet-4-6",
+    model_name = "gpt-4o-mini",
 
     -- ------------------------------------------------------------------
     --  How many seconds to wait for a response before giving up

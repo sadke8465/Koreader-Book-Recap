@@ -233,7 +233,7 @@ function Recap:_previousChapterInfo(page_num)
     local last_page = current_chapter_start - 1
 
     -- Cap at total page count
-    local total_pages = doc:getPageCount and doc:getPageCount() or last_page
+    local total_pages = doc.getPageCount and doc:getPageCount() or last_page
     if last_page > total_pages then last_page = total_pages end
 
     return {
